@@ -67,6 +67,32 @@ class CombinedConstraint(torch.nn.Module):
             # Re-sort the probe modes, note that the masked strong modes might be swapping order with unmasked weak modes
             model.opt_probe.data = torch.view_as_real(sort_by_mode_int(probe_r))
             vprint(f"Apply Fourier-space probe amplitude constraint at iter {niter}, pmode_index = {pmode_index} when power_thresh = {power_thresh}, probe int sum = {probe_int.sum():.4f}", verbose=self.verbose)
+
+    def apply_probe_mask_r(self, model, niter):
+        ''' Apply probe amplitude constraint in real space '''
+        # Note that this will change the total probe intensity, please use this with `fix_probe_int`
+        # Although the mask wouldn't change during the iteration, making a mask takes only ~0.5us on CPU so really no need to pre-calculate it
+        # The sandwitch fftshift(fft(ifftshift(probe))) is needed to properly handle the complex probe without serrated phase
+        # fft2 is for real->fourier, while fftshift2 is for corner->center
+
+        probe_mask_r_freq = self.constraint_params['probe_mask_r']['freq']
+        relative_radius   = self.constraint_params['probe_mask_r']['radius']
+        relative_width    = self.constraint_params['probe_mask_r']['width']
+        power_thresh      = self.constraint_params['probe_mask_r']['power_thresh']
+        if probe_mask_r_freq is not None and niter % probe_mask_r_freq == 0:
+            probe = model.get_complex_probe_view()
+            Npix = probe.size(-1)
+            powers = probe.abs().pow(2).sum((-2,-1)) / probe.abs().pow(2).sum()
+            powers_cumsum = powers.cumsum(0)
+            pmode_index = (powers_cumsum > power_thresh).nonzero()[0].item() # This gives the pmode index that the cumulative power along mode dimension is greater than the power_thresh and should have mask extend to this index
+            mask = torch.ones_like(probe, dtype=torch.float32, device=model.device)
+            mask_value = make_sigmoid_mask(Npix, relative_radius, relative_width).to(model.device)
+            mask[:pmode_index+1] = mask_value
+            probe_r = mask * probe # probe_r at center. Note that the norm='ortho' is explicitly specified but not needed for a round-trip
+            probe_int = model.get_complex_probe_view().abs().pow(2)
+            # Re-sort the probe modes, note that the masked strong modes might be swapping order with unmasked weak modes
+            model.opt_probe.data = torch.view_as_real(sort_by_mode_int(probe_r))
+            vprint(f"Apply real-space probe amplitude constraint at iter {niter}, pmode_index = {pmode_index} when power_thresh = {power_thresh}, probe int sum = {probe_int.sum():.4f}", verbose=self.verbose)
     
     def apply_fix_probe_int(self, model, niter):
         ''' Apply probe intensity constraint '''
@@ -122,6 +148,7 @@ class CombinedConstraint(torch.nn.Module):
         obj_type         = self.constraint_params['kr_filter']['obj_type']
         relative_radius  = self.constraint_params['kr_filter']['radius']
         relative_width   = self.constraint_params['kr_filter']['width']
+        relative_radius *=  (niter) ** self.constraint_params['kr_filter']['pow']
         if kr_filter_freq is not None and niter % kr_filter_freq == 0:
             if obj_type in ['amplitude', 'both']:
                 model.opt_obja.data = kr_filter(model.opt_obja, relative_radius, relative_width)
@@ -129,7 +156,7 @@ class CombinedConstraint(torch.nn.Module):
             if obj_type in ['phase', 'both']:
                 model.opt_objp.data = kr_filter(model.opt_objp, relative_radius, relative_width)
                 vprint(f"Apply kr_filter constraint with kr_radius = {relative_radius} on objp at iter {niter}", verbose=self.verbose)
-        
+                
     def apply_kz_filter(self, model, niter):
         ''' Apply kz Fourier filter constraint on object '''
         # Note that the `kz_filter`` behaves differently for 'amplitude' and 'phase', see `kz_filter` implementaion for details
@@ -225,6 +252,43 @@ class CombinedConstraint(torch.nn.Module):
             model.opt_obj_tilts.data = gaussian_blur(obj_tilts, kernel_size=5, sigma=tilt_smooth_std).permute(1,2,0).reshape(-1,2).contiguous() # contiguous() returns a contiguous memory layout so that DDP wouldn't complain about the stride mismatch of grad and params
             vprint(f"Apply Gaussian blur with std = {tilt_smooth_std} scan positions on obj_tilts at iter {niter}", verbose=self.verbose)
     
+    def apply_tv_denoise_chambolle(self, model, niter):
+        ''' Apply total-variation denoising on object '''
+        # Note that the `denoise_tv_chambolle_pytorch` is applied on stacked 2D object, so it's applying on (omode,z,ky,kx)
+        tv_denoise_freq = self.constraint_params['tv_denoise_chambolle']['freq']
+        weight          = self.constraint_params['tv_denoise_chambolle']['weight']
+        if tv_denoise_freq is not None and niter % tv_denoise_freq == 0:
+            model.opt_obja.data = denoise_tv_chambolle_pytorch(model.opt_obja, weight=weight, axis=None, padding=1)
+            model.opt_objp.data = denoise_tv_chambolle_pytorch(model.opt_objp, weight=weight, axis=None, padding=1)
+            vprint(f"Apply TV denoising with weight = {weight} on obja and objp at iter {niter}", verbose=self.verbose)
+    
+    def apply_tv_denoise(self, model, niter):
+        ''' Apply total-variation denoising on object using PyTorch's TV denoising implementation '''
+        # Note that the `object_denoise_tv_pytorch` is applied on stacked 2D object, so it's applying on (omode,z,ky,kx)
+        tv_denoise_freq = self.constraint_params['tv_denoise']['freq']
+        weights         = self.constraint_params['tv_denoise']['weights']
+        iterations      = self.constraint_params['tv_denoise']['iterations']
+        z_padding      = self.constraint_params['tv_denoise']['z_padding']
+        if tv_denoise_freq is not None and niter % tv_denoise_freq == 0:
+            model.opt_obja.data = object_denoise_tv_pytorch(model.opt_obja, weights=weights, iterations=iterations, z_padding=z_padding)
+            model.opt_objp.data = object_denoise_tv_pytorch(model.opt_objp, weights=weights, iterations=iterations, z_padding=z_padding)
+            vprint(f"Apply TV denoising with weight = {weights} and iterations = {iterations} on obja and objp at iter {niter}", verbose=self.verbose)
+
+    def apply_obj_butterworth(self, model, niter):
+        ''' Apply Butterworth filter on object '''
+        # Note that the `object_butterworth_filter` is applied on stacked 2D object, so it's applying on (omode,z,ky,kx)
+        obj_butter_freq = self.constraint_params['obj_butterworth']['freq']
+        q_low          = self.constraint_params['obj_butterworth']['q_lowpass']
+        q_high         = self.constraint_params['obj_butterworth']['q_highpass']
+        order         = self.constraint_params['obj_butterworth']['butterworth_order']
+        obj_type      = self.constraint_params['obj_butterworth']['obj_type']
+        if obj_butter_freq is not None and niter % obj_butter_freq == 0:
+            if obj_type in ['amplitude', 'both']:
+                model.opt_obja.data = object_butterworth_constraint_torch(model.opt_obja, q_lowpass=q_low, q_highpass=q_high, butterworth_order=order)
+            if obj_type in ['phase', 'both']:
+                model.opt_objp.data = object_butterworth_constraint_torch(model.opt_objp, q_lowpass=q_low, q_highpass=q_high, butterworth_order=order)
+            vprint(f"Apply Butterworth filter with q_low = {q_low}, q_high = {q_high}, and order = {order} on obja and objp at iter {niter}", verbose=self.verbose)
+
     def forward(self, model, niter):
         # Apply in-place constraints if niter satisfies the predetermined frequency
         # Note that the if check blocks are included in each apply methods so that it's cleaner, and I can print the info with niter
@@ -233,8 +297,12 @@ class CombinedConstraint(torch.nn.Module):
             # Probe constraints
             self.apply_ortho_pmode  (model, niter)
             self.apply_probe_mask_k (model, niter)
+            self.apply_probe_mask_r (model, niter)
             self.apply_fix_probe_int(model, niter)
             # Object constraints
+            # self.apply_tv_denoise   (model, niter)
+            # self.apply_tv_denoise_chambolle(model, niter)
+            self.apply_obj_butterworth(model, niter)
             self.apply_obj_rblur    (model, niter)
             self.apply_obj_zblur    (model, niter)
             self.apply_kr_filter    (model, niter)
@@ -358,3 +426,420 @@ def complex_ratio_constraint(model, alpha1, alpha2):
     # Compute updated phase, note the negative sign for the second term!
     objpc = (1 - alpha2) * objp - alpha2 / (Cbar + 1e-8) * log_obja # Avoid division by zero
     return objac, objpc, Cbar
+
+import torch
+import torch.nn.functional as F
+import warnings
+
+def _object_denoise_tv_2p5d_pytorch(current_object: torch.Tensor, weights: list[float], iterations: int, z_padding: int) -> torch.Tensor:
+    """
+    Performs 2.5D TV denoising in PyTorch on a 3D tensor.
+
+    This function applies a first-order TV penalty (gradient) along the z-axis (dim 0)
+    and a second-order TV penalty (Laplacian) along the y and x axes (dims 1, 2).
+    It solves:
+        argmin_x (0.5 * ||x - x_orig||_2^2 + w_z * ||Grad_z(x)||_1 + w_xy * ||Lap_xy(x)||_1)
+    using manual gradient descent steps, making it compatible with `torch.compile`.
+
+    Parameters
+    ----------
+    current_object : torch.Tensor
+        The input 3D tensor to be denoised, shape [depth, height, width].
+    weights : list[float]
+        A list of two regularization weights: [z_weight, xy_weight].
+    iterations : int
+        The number of optimization iterations to perform.
+    z_padding : int
+        Symmetric zero-padding to apply to the z-axis before denoising.
+
+    Returns
+    -------
+    torch.Tensor
+        The denoised 3D tensor.
+    """
+    # --- 1. Input Validation and Setup ---
+    if torch.is_complex(current_object):
+        warnings.warn(
+            "TV denoising is applied to real-valued tensors. "
+            "Returning the original complex tensor without modification.",
+            UserWarning,
+        )
+        return current_object
+
+    if not torch.is_floating_point(current_object):
+        current_object = current_object.float()
+
+    device = current_object.device
+    z_weight, xy_weight = weights
+    
+    # --- 2. Apply Z-Padding ---
+    if z_padding > 0:
+        # PyTorch F.pad works on (..., D, H, W), so we pad the D dimension (dim 0).
+        padded_object = F.pad(current_object, (0, 0, 0, 0, z_padding, z_padding), "constant", 0)
+    else:
+        padded_object = current_object
+
+    denoised_object = padded_object.clone()
+    lr = 0.01
+
+    # --- 3. Kernel Definitions ---
+    # Kernel for first derivative (gradient) along the z-axis (backward difference)
+    z_gradient_kernel = torch.tensor([
+        [[0.,0.,0.],[0.,0.,0.],[0.,0.,0.]],
+        [[0.,0.,0.],[0.,-1.,0.],[0.,0.,0.]],
+        [[0.,0.,0.],[0.,1.,0.],[0.,0.,0.]]
+    ], device=device).unsqueeze(0).unsqueeze(0)
+
+    # Kernel for second derivative (Laplacian) in the xy-plane
+    xy_laplacian_kernel = torch.tensor([
+        [[0.,0.,0.],[0.,0.,0.],[0.,0.,0.]],
+        [[0.,1.,0.],[1.,-4.,1.],[0.,1.,0.]],
+        [[0.,0.,0.],[0.,0.,0.],[0.,0.,0.]]
+    ], device=device).unsqueeze(0).unsqueeze(0)
+
+    # --- 4. Manual Optimization Loop ---
+    for i in range(iterations):
+        denoised_object.requires_grad_(True)
+        fidelity_loss = 0.5 * F.mse_loss(denoised_object, padded_object, reduction='sum')
+        total_loss = fidelity_loss
+        
+        # Reshape for 3D convolution: (N, C, D, H, W)
+        obj_for_conv = denoised_object.unsqueeze(0).unsqueeze(0)
+
+        # Z-Gradient Regularization
+        if z_weight > 0:
+            z_grad_obj = F.conv3d(obj_for_conv, z_gradient_kernel, padding='same')
+            total_loss += z_weight * torch.sum(torch.abs(z_grad_obj))
+
+        # XY-Laplacian Regularization
+        if xy_weight > 0:
+            xy_lap_obj = F.conv3d(obj_for_conv, xy_laplacian_kernel, padding='same')
+            total_loss += xy_weight * torch.sum(torch.abs(xy_lap_obj))
+
+        grad = torch.autograd.grad(total_loss, denoised_object, only_inputs=True)[0]
+
+        with torch.no_grad():
+            denoised_object -= lr * grad
+
+    # --- 5. Remove Padding and Return ---
+    if z_padding > 0:
+        # Crop the z-axis (dimension 0)
+        final_object = denoised_object[z_padding:-z_padding, :, :]
+    else:
+        final_object = denoised_object
+
+    return final_object.detach()
+
+def object_denoise_tv_pytorch(current_object: torch.Tensor, weights: list[float], iterations: int, z_padding: int) -> torch.Tensor:
+    """
+    Performs TV denoising on a 4D tensor by applying 2.5D denoising to each time slice.
+
+    The input tensor is expected to have dimensions (time, depth, y, x).
+    This function iterates over the time dimension and applies the 
+    `_object_denoise_tv_2p5d_pytorch` function to each 3D slice, effectively
+    denoising the z (depth) and y,x dimensions while leaving the time axis untouched.
+
+    Parameters
+    ----------
+    current_object : torch.Tensor
+        The input 4D tensor, shape [time, depth, height, width].
+    weights : list[float]
+        A list of two regularization weights for the 2.5D function: [z_weight, xy_weight].
+    iterations : int
+        The number of optimization iterations to perform for each slice.
+    z_padding : int
+        Symmetric zero-padding for the depth (z) axis.
+
+    Returns
+    -------
+    torch.Tensor
+        The denoised 4D tensor.
+    """
+    # --- 1. Input Validation ---
+    if current_object.dim() != 4:
+        raise ValueError(f"Input tensor must be 4D, but got {current_object.dim()}D")
+
+    # --- 2. Iterate over Time Dimension ---
+    denoised_slices = []
+    for t in range(current_object.shape[0]):
+        # Get the 3D slice for the current time step
+        slice_3d = current_object[t]
+        
+        # Apply the 2.5D denoising function to the slice
+        denoised_slice = _object_denoise_tv_2p5d_pytorch(
+            current_object=slice_3d,
+            weights=weights,
+            iterations=iterations,
+            z_padding=z_padding
+        )
+        denoised_slices.append(denoised_slice)
+
+    # --- 3. Stack Results ---
+    # Combine the list of denoised 3D slices back into a 4D tensor
+    return torch.stack(denoised_slices, dim=0)
+
+@torch.compiler.disable
+def denoise_tv_chambolle_pytorch(
+    current_object: torch.Tensor,
+    weight: float,
+    axis=None,
+    padding: int = None,
+    eps: float = 2.0e-4,
+    max_num_iter: int = 200,
+    scaling=None,
+):
+    """
+    Perform total-variation denoising on n-dimensional images using PyTorch.
+
+    This is a PyTorch implementation of the Rudin, Osher, and Fatemi (ROF)
+    model using Chambolle's algorithm.
+
+    Parameters
+    ----------
+    current_object : torch.Tensor
+        The input tensor to be denoised.
+    weight : float
+        Denoising weight. The greater `weight`, the more denoising (at
+        the expense of fidelity to `input`).
+    axis : int or tuple, optional
+        Axes along which to perform denoising. If None (default), denoising
+        is performed on all axes.
+    padding : int, optional
+        The size of padding to apply along the denoising axes. This helps
+        to reduce boundary artifacts.
+    eps : float, optional
+        Relative difference of the cost function that determines the stop
+        criterion. The algorithm stops when `(E_new - E_old) < eps * E_init`.
+    max_num_iter : int, optional
+        Maximal number of iterations for the optimization.
+    scaling : list or torch.Tensor, optional
+        Scale factor for the TV norm on each axis. Must have the same
+        length as the number of axes being denoised.
+
+    Returns
+    -------
+    torch.Tensor
+        The denoised tensor.
+    """
+    # Ensure input is a floating point tensor for calculations
+    if not current_object.is_floating_point():
+        current_object = current_object.float()
+
+    device = current_object.device
+    dtype = current_object.dtype
+
+    # Preserve the sum of the original object for final normalization
+    original_sum = torch.sum(current_object)
+
+    # --- Axis Handling ---
+    if axis is None:
+        denoise_axes = list(range(current_object.dim()))
+    elif isinstance(axis, int):
+        denoise_axes = [axis]
+    else:
+        denoise_axes = list(axis)
+    
+    num_axes = len(denoise_axes)
+
+    # --- Padding ---
+    if padding is not None and padding > 0:
+        # F.pad expects a flat list for padding: (pad_left_dimN, pad_right_dimN, ...)
+        # We construct it by iterating through dimensions in reverse order.
+        pad_arg = [0] * (current_object.dim() * 2)
+        for ax in denoise_axes:
+            # Dims are counted from the end for F.pad's argument
+            idx = (current_object.dim() - 1 - ax) * 2
+            pad_arg[idx] = padding
+            pad_arg[idx + 1] = padding
+        padded_object = F.pad(current_object, pad_arg, mode="constant", value=0)
+    else:
+        padded_object = current_object
+
+    # --- Initialize Tensors ---
+    # Dual variable `p` has a dimension for each denoising axis
+    p_shape = (num_axes,) + padded_object.shape
+    p = torch.zeros(p_shape, dtype=dtype, device=device)
+    g = torch.zeros_like(p)
+    d = torch.zeros_like(padded_object)
+    
+    # Use a separate variable for the iteratively updated object
+    updated_object = padded_object.clone()
+
+    E_init = 0.0
+    E_previous = 0.0
+
+    # --- Main Iteration Loop ---
+    for i in range(max_num_iter):
+        if i > 0:
+            # --- Update `d` (divergence of p) ---
+            # This calculates d = -div(p) using backward differences
+            d = -torch.sum(p, dim=0)
+            for p_idx, img_ax in enumerate(denoise_axes):
+                # Create slices for efficient tensor indexing
+                d_slice = [slice(None)] * padded_object.dim()
+                p_slice = [slice(None)] * p.dim()
+
+                d_slice[img_ax] = slice(1, None)
+                p_slice[p_idx + 1] = slice(0, -1)
+                p_slice[0] = p_idx
+                
+                d[tuple(d_slice)] += p[tuple(p_slice)]
+
+            updated_object = padded_object + d
+        
+        E = torch.sum(d**2)
+
+        # --- Update `g` (gradient of the updated object) ---
+        # This calculates the forward-difference gradient
+        g.zero_() # Reset gradient
+        for p_idx, img_ax in enumerate(denoise_axes):
+            diffs = torch.diff(updated_object, dim=img_ax)
+            
+            # Place differences into the gradient tensor `g`
+            g_slice = [slice(None)] * p.dim()
+            g_slice[p_idx + 1] = slice(0, -1)
+            g_slice[0] = p_idx
+            
+            g[tuple(g_slice)] = diffs
+        
+        if scaling is not None:
+            if not isinstance(scaling, torch.Tensor):
+                scaling = torch.tensor(scaling, dtype=dtype, device=device)
+            scaling = scaling / torch.max(scaling)
+            # Reshape for broadcasting: e.g., (num_axes, 1, 1) for a 2D image
+            g *= scaling.view(-1, *([1] * updated_object.dim()))
+
+        # --- Update dual variable `p` ---
+        norm = torch.sqrt(torch.sum(g**2, dim=0, keepdim=True))
+        E += weight * torch.sum(norm)
+        
+        tau = 1.0 / (2.0 * num_axes)
+        
+        denom = 1.0 + (tau / weight) * norm
+        
+        p = (p - tau * g) / denom
+
+        # --- Check for Convergence ---
+        E_current = E / padded_object.numel()
+        if i == 0:
+            E_init = E_current
+        else:
+            if torch.abs(E_previous - E_current) < eps * E_init:
+                break
+        
+        E_previous = E_current
+
+    # --- Un-padding ---
+    if padding is not None and padding > 0:
+        unpad_slices = [slice(None)] * updated_object.dim()
+        for ax in denoise_axes:
+            unpad_slices[ax] = slice(padding, -padding)
+        updated_object = updated_object[tuple(unpad_slices)]
+
+    # --- Final Normalization ---
+    # Rescale to preserve the original object's total sum/energy
+    final_sum = torch.sum(updated_object)
+    if final_sum > 1e-9: # Avoid division by zero
+        updated_object = updated_object / final_sum * original_sum
+
+    return updated_object
+
+import torch
+
+def _object_butterworth_constraint_torch(
+    current_object, q_lowpass, q_highpass, butterworth_order
+):
+    """
+    Butterworth filter implemented in PyTorch.
+
+    Parameters
+    ----------
+    current_object: torch.Tensor
+        Current object estimate.
+    q_lowpass: float
+        Cut-off frequency in A^-1 for low-pass butterworth filter.
+    q_highpass: float
+        Cut-off frequency in A^-1 for high-pass butterworth filter.
+    butterworth_order: float
+        Butterworth filter order. Smaller values result in a smoother filter.
+        
+    Returns
+    -------
+    constrained_object: torch.Tensor
+        Constrained object estimate.
+    """
+    # Ensure all calculations are done on the same device as the input tensor
+    device = current_object.device
+
+    # Create frequency coordinates for each dimension
+    qz = torch.fft.fftfreq(current_object.shape[0], 1., device=device)
+    qx = torch.fft.fftfreq(current_object.shape[1], 1., device=device)
+    qy = torch.fft.fftfreq(current_object.shape[2], 1., device=device)
+
+    # Create a 3D grid of frequency magnitudes
+    qza, qxa, qya = torch.meshgrid(qz, qx, qy, indexing="ij")
+    qra = torch.sqrt(qza**2 + qxa**2 + qya**2)
+
+    # Initialize the filter envelope
+    env = torch.ones_like(qra)
+
+    # Apply high-pass filter if specified
+    if q_highpass:
+        env *= 1 - 1 / (1 + (qra / q_highpass) ** (2 * butterworth_order))
+    
+    # Apply low-pass filter if specified
+    if q_lowpass:
+        env *= 1 / (1 + (qra / q_lowpass) ** (2 * butterworth_order))
+
+    # Apply the filter in Fourier space, preserving the mean of the original object
+    current_object_mean = torch.mean(current_object)
+    current_object = current_object - current_object_mean
+    
+    # Forward FFT, apply filter, and inverse FFT
+    current_object_fft = torch.fft.fftn(current_object)
+    filtered_object_fft = current_object_fft * env
+    current_object = torch.fft.ifftn(filtered_object_fft)
+    current_object = current_object + current_object_mean
+
+    return current_object.real
+
+def object_butterworth_constraint_torch(
+    current_object, q_lowpass, q_highpass, butterworth_order
+):
+    """
+    Wrapper function for the Butterworth filter for 4D object.
+
+    Parameters
+    ----------
+    current_object: torch.Tensor
+        Current object estimate.
+    q_lowpass: float
+        Cut-off frequency in A^-1 for low-pass butterworth filter.
+    q_highpass: float
+        Cut-off frequency in A^-1 for high-pass butterworth filter.
+    butterworth_order: float
+        Butterworth filter order. Smaller values result in a smoother filter.
+
+    Returns
+    -------
+    constrained_object: torch.Tensor
+        Constrained object estimate.
+    """
+    
+    # Check if the input is a 4D tensor
+    if current_object.dim() != 4:
+        raise ValueError(f"Input tensor must be 4D, but got {current_object.dim()}D")
+
+    # Apply the Butterworth filter to each time slice
+    denoised_slices = []
+    for t in range(current_object.shape[0]):
+        slice_3d = current_object[t]
+        denoised_slice = _object_butterworth_constraint_torch(
+            slice_3d, q_lowpass, q_highpass, butterworth_order
+        )
+        denoised_slices.append(denoised_slice)
+
+    # Stack the denoised slices back into a 4D tensor
+    return torch.stack(denoised_slices, dim=0)
+    
+    

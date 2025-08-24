@@ -421,7 +421,7 @@ def plot_probe_modes(init_probe, opt_probe, amp_or_phase='amplitude', real_or_fo
         return fig
 
 @torch.compiler.disable
-def plot_summary(output_path, model, niter, indices, init_variables, selected_figs=['loss', 'forward', 'probe_r_amp', 'probe_k_amp', 'probe_k_phase', 'pos'], collate_str='', show_fig=True, save_fig=False, verbose=True):
+def plot_summary(output_path, model, niter, indices, init_variables, params, selected_figs=['loss', 'forward', 'probe_r_amp', 'probe_k_amp', 'probe_k_phase', 'pos'], collate_str='', show_fig=True, save_fig=False, verbose=True):
     """ Wrapper function for most visualization function """
     # selected_figs can take 'loss', 'forward', 'probe_r_amp', 'probe_k_amp', 'probe_k_phase', 'pos', 'tilt', or 'all'
     # Note: Set show_fig=False and save_fig=True if you just want to save the figure without showing
@@ -448,7 +448,8 @@ def plot_summary(output_path, model, niter, indices, init_variables, selected_fi
         n = int(len(indices)**0.5)
         n2 = int(len(indices))
         plot_indices = indices[np.int32([n2/2+n/4, n2/2+3*n/4])] # The idea is to get 2 regions of (N/2)x(N/2) that are +-N/4 from the center of the FOV.
-        fig_forward = plot_forward_pass(model, plot_indices, 0.5, show_fig=False, pass_fig=True)
+        power = params['recon_params']['dp_power']
+        fig_forward = plot_forward_pass(model, plot_indices, power, show_fig=False, pass_fig=True)
         fig_forward.suptitle(f"Forward pass at iter {niter}", fontsize=24)
         if show_fig:
             fig_forward.show()

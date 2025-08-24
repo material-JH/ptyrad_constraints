@@ -91,6 +91,8 @@ class ReconParams(BaseModel):
     Usually 10-20 iterations are enough for the hypertune parameters to show their relative performance. 
     """
     
+    dp_power: float = Field(default=0.5, ge=0, description="Power for diffraction pattern normalization")
+    
     INDICES_MODE: IndicesMode = Field(default_factory=IndicesMode, description="Indices mode configuration")
     """
     Indices mode determines multiple ways to use diffraction patterns at each probe positions for reconstructions. 

@@ -49,6 +49,7 @@ class KrFilter(BaseModel):
     obj_type: Literal["amplitude", "phase", "both"] = Field(default="both", description="Object type for filter")
     radius: float = Field(default=0.15, ge=0.0, description="Radius of sigmoid filter in relative kMax units")
     width: float = Field(default=0.05, ge=0.0, description="Width of sigmoid filter transition")
+    pow: float = Field(default=0.0, ge=0.0, description="Power of the filter radius scaling with iteration number")
 
 
 class KzFilter(BaseModel):
@@ -103,6 +104,32 @@ class TiltSmooth(BaseModel):
     freq: Optional[int] = Field(default=None, ge=1, description="Frequency of applying tilt smoothing")
     std: float = Field(default=2.0, ge=0.0, description="Standard deviation for Gaussian blur of tilts")
 
+class TVDenoise(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    freq: Optional[int] = Field(default=None, ge=1, description="Frequency of applying total-variation denoising")
+    weights: List[float] = Field(
+        default=[0.1, 0.1], description="Weights for TV denoising"
+    )
+    iterations: int = Field(default=40, ge=1, description="Number of iterations for TV denoising")
+    z_padding: int = Field(default=1, ge=0, description="Amount of zero-padding to apply during TV denoising")
+
+class DenoiseTVChambolle(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    freq: Optional[int] = Field(default=None, ge=1, description="Frequency of applying Chambolle's total-variation denoising")
+    weight: float = Field(default=0.1, ge=0.0, description="Weight for Chambolle's TV denoising")
+
+class ButterworthFilter(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    freq: Optional[int] = Field(default=None, ge=1, description="Frequency of applying Butterworth filter")
+    q_lowpass: float = Field(default=0.1, ge=0.0, description="Low-pass cutoff frequency for Butterworth filter")
+    q_highpass: float = Field(default=0.5, ge=0.0, description="High-pass cutoff frequency for Butterworth filter")
+    butterworth_order: int = Field(default=2, ge=1, description="Order of the Butterworth filter")
+    obj_type: Literal["amplitude", "phase", "both"] = Field(
+        default="both", description="Object type for Butterworth filter"
+    )
 
 class ConstraintParams(BaseModel):
     """
@@ -130,6 +157,7 @@ class ConstraintParams(BaseModel):
     """
     
     probe_mask_k: ProbeMaskK = Field(default_factory=ProbeMaskK, description="K-space probe mask")
+    probe_mask_r: ProbeMaskK = Field(default_factory=ProbeMaskK, description="Real-space probe mask")
     """
     Apply a k-space sigmoid (similar to a top-hat) probe mask that cut off spatial frequencies beyond the probe-forming aperture. 
     This prevents the probe from absorbing the object structure in k-space. 
@@ -257,3 +285,17 @@ class ConstraintParams(BaseModel):
     This smoothens the local tilts so that you don't have drastic changes of object tilts between scan positions.
     """
     
+    tv_denoise: TVDenoise = Field(
+        default_factory=TVDenoise, description="Total-variation denoising of object"
+    )
+    """
+    Apply total-variation denoising on object
+    """
+    
+    tv_denoise_chambolle: DenoiseTVChambolle = Field(
+        default_factory=DenoiseTVChambolle, description="Chambolle's total-variation denoising of object"
+    )
+    
+    obj_butterworth: ButterworthFilter = Field(
+        default_factory=ButterworthFilter, description="Butterworth filter for object"
+    )

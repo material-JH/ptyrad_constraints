@@ -678,7 +678,7 @@ def recon_loop(model, init, params, optimizer, loss_fn, constraint_fn, indices, 
                     save_results(output_path, model_instance, params, optimizer, niter, indices, batch_losses)
                     
                     ## Saving summary
-                    plot_summary(output_path, model_instance, niter, indices, init_variables, selected_figs=selected_figs, show_fig=False, save_fig=True, verbose=verbose)
+                    plot_summary(output_path, model_instance, niter, indices, init_variables, params, selected_figs=selected_figs, show_fig=False, save_fig=True, verbose=verbose)
     
     model_instance = model.module if hasattr(model, "module") else model
     vprint(f"### Finished {NITER} iterations, averaged iter_t = {np.mean(model_instance.iter_times):.5g} with std = {np.std(model_instance.iter_times):.3f} ###", verbose=verbose)
@@ -1102,7 +1102,7 @@ def optuna_objective(trial, params, init, loss_fn, constraint_fn, device='cuda',
         ## Saving intermediate results
         if SAVE_ITERS is not None and niter % SAVE_ITERS == 0:
             save_results(output_path, model, params, optimizer, niter, indices, batch_losses, collate_str='')
-            plot_summary(output_path, model, niter, indices, init.init_variables, selected_figs=selected_figs, collate_str='', show_fig=False, save_fig=True, verbose=verbose)
+            plot_summary(output_path, model, niter, indices, init.init_variables, params, selected_figs=selected_figs, collate_str='', show_fig=False, save_fig=True, verbose=verbose)
                
         ## Pruning logic for optuna
         if hypertune_params['pruner_params'] is not None:
@@ -1117,7 +1117,7 @@ def optuna_objective(trial, params, init, loss_fn, constraint_fn, device='cuda',
                 collate_str = f"_error_{optuna_error:.5f}_{trial_id}{params_str}"
                 if collate_results:
                     save_results(output_dir, model, params, optimizer, niter, indices, batch_losses, collate_str=collate_str)
-                    plot_summary(output_dir, model, niter, indices, init.init_variables, selected_figs=selected_figs, collate_str=collate_str, show_fig=False, save_fig=True, verbose=verbose)
+                    plot_summary(output_dir, model, niter, indices, init.init_variables, params, selected_figs=selected_figs, collate_str=collate_str, show_fig=False, save_fig=True, verbose=verbose)
                 raise optuna.exceptions.TrialPruned()
 
     ## Final optuna_error evaluation (only needed if pruner never ran)
@@ -1129,8 +1129,8 @@ def optuna_objective(trial, params, init, loss_fn, constraint_fn, device='cuda',
     collate_str = f"_error_{optuna_error:.5f}_{trial_id}{params_str}"
     if collate_results:
         save_results(output_dir, model, params, optimizer, niter, indices, batch_losses, collate_str=collate_str)
-        plot_summary(output_dir, model, niter, indices, init.init_variables, selected_figs=selected_figs, collate_str=collate_str, show_fig=False, save_fig=True, verbose=verbose)
-    
+        plot_summary(output_dir, model, niter, indices, init.init_variables, params, selected_figs=selected_figs, collate_str=collate_str, show_fig=False, save_fig=True, verbose=verbose)
+
     vprint(f"### Finished {NITER} iterations, averaged iter_t = {np.mean(model.iter_times):.3g} sec ###", verbose=verbose)
     vprint(" ", verbose=verbose)
     return optuna_error
